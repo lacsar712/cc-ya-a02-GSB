@@ -1,23 +1,17 @@
-import { css, html, LitElement } from "lit";
+import { css, html, LitElement, nothing } from "lit";
 import { customElement, state } from "lit/decorators.js";
 
-type LogRow = {
-  id: number;
-  turbine_code: string;
-  yaw_err_deg: number;
-  status: string;
-  verdict: string | null;
-  reason: string | null;
-  created_by: string;
-  created_at: string;
-  processed_at: string | null;
-};
+import {
+  apiFetch,
+  ApiError,
+  formatBand,
+  type Band,
+  type LogRow,
+  type Session,
+} from "./api";
+import "./bands-page";
 
-type Session = {
-  token: string;
-  username: string;
-  role: string;
-};
+type View = "logs" | "bands";
 
 @customElement("yaw-align-app")
 export class YawAlignApp extends LitElement {
@@ -26,18 +20,59 @@ export class YawAlignApp extends LitElement {
       display: block;
       min-height: 100vh;
       box-sizing: border-box;
-      padding: 1.5rem;
-      max-width: 960px;
-      margin: 0 auto;
     }
-    h1 {
-      margin: 0 0 0.25rem;
-      font-size: 1.75rem;
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.6rem 1.25rem;
+      background: #0b1220;
+      border-bottom: 1px solid #334155;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .brand {
+      font-size: 1.15rem;
+      font-weight: 700;
       color: #38bdf8;
+      margin-right: 0.5rem;
+    }
+    .topbar nav {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .topbar nav button {
+      background: transparent;
+      color: #cbd5e1;
+      border: 1px solid transparent;
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      font-weight: 600;
+    }
+    .topbar nav button.active {
+      background: #164e63;
+      color: #a5f3fc;
+      border-color: #0e7490;
+    }
+    .topbar nav button:hover {
+      border-color: #475569;
+    }
+    .spacer {
+      flex: 1;
+    }
+    .who {
+      color: #94a3b8;
+      font-size: 0.85rem;
+    }
+    main {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 1.25rem 1.5rem 2rem;
     }
     .sub {
       color: #94a3b8;
-      margin-bottom: 1.5rem;
+      margin: 0 0 1.25rem;
     }
     section {
       background: #1e293b;
@@ -45,6 +80,11 @@ export class YawAlignApp extends LitElement {
       padding: 1rem 1.25rem;
       margin-bottom: 1rem;
       border: 1px solid #334155;
+    }
+    h2 {
+      margin: 0 0 0.5rem;
+      font-size: 1.1rem;
+      color: #7dd3fc;
     }
     label {
       display: block;
@@ -77,6 +117,34 @@ export class YawAlignApp extends LitElement {
     button:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+    }
+    .band-picker {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.75rem;
+    }
+    .band-option {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.45rem 0.8rem;
+      border-radius: 6px;
+      border: 1px solid #475569;
+      background: #0f172a;
+      color: #cbd5e1;
+      cursor: pointer;
+      font-size: 0.9rem;
+      margin-bottom: 0;
+    }
+    .band-option.chosen {
+      border-color: #38bdf8;
+      background: #164e63;
+      color: #a5f3fc;
+    }
+    .band-option input {
+      width: auto;
+      margin: 0;
     }
     table {
       width: 100%;
@@ -124,11 +192,14 @@ export class YawAlignApp extends LitElement {
   `;
 
   @state() private session: Session | null = null;
+  @state() private view: View = "logs";
   @state() private logs: LogRow[] = [];
+  @state() private bands: Band[] = [];
   @state() private loginUser = "technician";
   @state() private loginPass = "tech123456";
   @state() private turbineCode = "";
   @state() private yawErr = "";
+  @state() private selectedBand = "";
   @state() private error = "";
   @state() private loading = false;
 
@@ -138,8 +209,8 @@ export class YawAlignApp extends LitElement {
     if (raw) {
       try {
         this.session = JSON.parse(raw) as Session;
-        void this.refreshLogs();
-        this._pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+        void this.refreshAll();
+        this._pollTimer = window.setInterval(() => void this.refreshAll(), 2000);
       } catch {
         localStorage.removeItem("yaw_session");
       }
@@ -155,24 +226,24 @@ export class YawAlignApp extends LitElement {
 
   private _pollTimer?: number;
 
-  private authHeaders(): HeadersInit {
-    return this.session
-      ? { Authorization: `Bearer ${this.session.token}` }
-      : {};
+  private get isWriter() {
+    return this.session?.role === "writer";
   }
 
-  private async refreshLogs() {
+  private async refreshAll() {
     if (!this.session) return;
     try {
-      const res = await fetch("/api/logs", { headers: this.authHeaders() });
-      if (res.status === 401) {
+      const [logs, bands] = await Promise.all([
+        apiFetch<LogRow[]>(this.session, "/api/logs"),
+        apiFetch<Band[]>(this.session, "/api/bands"),
+      ]);
+      this.logs = logs;
+      this.bands = bands;
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
         this.logout();
-        return;
       }
-      if (!res.ok) return;
-      this.logs = (await res.json()) as LogRow[];
-    } catch {
-      /* ignore transient network errors */
+      /* 其余瞬时错误忽略，下一轮轮询再试 */
     }
   }
 
@@ -199,8 +270,8 @@ export class YawAlignApp extends LitElement {
         role: data.role,
       };
       localStorage.setItem("yaw_session", JSON.stringify(this.session));
-      await this.refreshLogs();
-      this._pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+      await this.refreshAll();
+      this._pollTimer = window.setInterval(() => void this.refreshAll(), 2000);
     } catch {
       this.error = "无法连接接口";
     } finally {
@@ -212,38 +283,38 @@ export class YawAlignApp extends LitElement {
     if (this._pollTimer) clearInterval(this._pollTimer);
     this.session = null;
     this.logs = [];
+    this.bands = [];
+    this.view = "logs";
     localStorage.removeItem("yaw_session");
-  }
-
-  private get isWriter() {
-    return this.session?.role === "writer";
   }
 
   private async submitLog() {
     this.error = "";
+    if (!this.selectedBand) {
+      this.error = "新单必须点选功率档，漏选整单退回";
+      return;
+    }
+    if (!this.session) return;
     this.loading = true;
     try {
-      const res = await fetch("/api/logs", {
+      await apiFetch<LogRow>(this.session, "/api/logs", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...this.authHeaders(),
-        },
         body: JSON.stringify({
           turbine_code: this.turbineCode,
           yaw_err_deg: Number(this.yawErr),
+          band_code: this.selectedBand,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        this.error = data.detail || "提交失败";
-        return;
-      }
       this.turbineCode = "";
       this.yawErr = "";
-      await this.refreshLogs();
-    } catch {
-      this.error = "提交时网络异常";
+      this.selectedBand = "";
+      await this.refreshAll();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        this.logout();
+        return;
+      }
+      this.error = err instanceof Error ? err.message : "提交时网络异常";
     } finally {
       this.loading = false;
     }
@@ -256,11 +327,13 @@ export class YawAlignApp extends LitElement {
     return "";
   }
 
-  render() {
-    if (!this.session) {
-      return html`
-        <h1>风机偏航对中台</h1>
-        <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
+  private renderLogin() {
+    return html`
+      <main>
+        <h1 style="color:#38bdf8;margin:0 0 0.25rem;">风机偏航对中台</h1>
+        <p class="sub">
+          偏航合格判定按功率档分带：新单必须点选功率档，判定吃该档现行闭区间。
+        </p>
         <section>
           <label>用户名</label>
           <input
@@ -276,63 +349,106 @@ export class YawAlignApp extends LitElement {
               (this.loginPass = (e.target as HTMLInputElement).value)}
           />
           <button ?disabled=${this.loading} @click=${this.login}>登录</button>
-          ${this.error ? html`<p class="err">${this.error}</p>` : null}
+          ${this.error ? html`<p class="err">${this.error}</p>` : nothing}
         </section>
-      `;
-    }
+      </main>
+    `;
+  }
 
+  private renderTopbar() {
     return html`
-      <h1>风机偏航对中台</h1>
-      <p class="sub">
-        已登录：${this.session.username}
-        (${this.isWriter ? "可提交" : "只读"})
-      </p>
+      <div class="topbar">
+        <span class="brand">风机偏航对中台</span>
+        <nav>
+          <button
+            class=${this.view === "logs" ? "active" : ""}
+            @click=${() => (this.view = "logs")}
+          >
+            对中记录
+          </button>
+          <button
+            class=${this.view === "bands" ? "active" : ""}
+            @click=${() => (this.view = "bands")}
+          >
+            功率档合格带台
+          </button>
+        </nav>
+        <span class="spacer"></span>
+        <span class="who">
+          ${this.session?.username}（${this.isWriter ? "技师·可提交可改档" : "观察员·只读"}）
+        </span>
+        <button class="secondary" @click=${this.logout}>退出</button>
+      </div>
+    `;
+  }
+
+  private renderSubmitForm() {
+    if (!this.isWriter) return nothing;
+    return html`
       <section>
-        <div class="row-actions">
-          <button class="secondary" @click=${this.logout}>退出</button>
-          <button class="secondary" ?disabled=${this.loading} @click=${this.refreshLogs}>
+        <h2>提交偏航记录</h2>
+        <label>机组编号</label>
+        <input
+          placeholder="例如 W12"
+          .value=${this.turbineCode}
+          @input=${(e: Event) =>
+            (this.turbineCode = (e.target as HTMLInputElement).value)}
+        />
+        <label>功率档（必点，漏选整单退回）</label>
+        <div class="band-picker" role="radiogroup" aria-label="功率档">
+          ${this.bands.map(
+            (b) => html`
+              <label
+                class="band-option ${this.selectedBand === b.code ? "chosen" : ""}"
+              >
+                <input
+                  type="radio"
+                  name="band"
+                  .checked=${this.selectedBand === b.code}
+                  @change=${() => (this.selectedBand = b.code)}
+                />
+                ${b.name} ${formatBand(b.lower_deg, b.upper_deg)}
+              </label>
+            `,
+          )}
+        </div>
+        <label>偏航误差（度，可正可负）</label>
+        <input
+          type="number"
+          step="0.1"
+          .value=${this.yawErr}
+          @input=${(e: Event) =>
+            (this.yawErr = (e.target as HTMLInputElement).value)}
+        />
+        <button ?disabled=${this.loading} @click=${this.submitLog}>
+          提交（进入待认领队列）
+        </button>
+        ${this.error ? html`<p class="err">${this.error}</p>` : nothing}
+      </section>
+    `;
+  }
+
+  private renderLogsView() {
+    return html`
+      ${this.renderSubmitForm()}
+      <section>
+        <div class="row-actions" style="margin-bottom:0.5rem;">
+          <h2 style="margin:0;">对中记录</h2>
+          <span class="spacer"></span>
+          <button class="secondary" ?disabled=${this.loading} @click=${this.refreshAll}>
             刷新列表
           </button>
         </div>
-      </section>
-
-      ${this.isWriter
-        ? html`
-            <section>
-              <h2 style="margin-top:0;font-size:1.1rem;">提交偏航记录</h2>
-              <label>机组编号</label>
-              <input
-                placeholder="例如 W12"
-                .value=${this.turbineCode}
-                @input=${(e: Event) =>
-                  (this.turbineCode = (e.target as HTMLInputElement).value)}
-              />
-              <label>偏航误差（度，可正可负）</label>
-              <input
-                type="number"
-                step="0.1"
-                .value=${this.yawErr}
-                @input=${(e: Event) =>
-                  (this.yawErr = (e.target as HTMLInputElement).value)}
-              />
-              <button ?disabled=${this.loading} @click=${this.submitLog}>
-                提交（进入待认领队列）
-              </button>
-              ${this.error ? html`<p class="err">${this.error}</p>` : null}
-            </section>
-          `
-        : null}
-
-      <section>
-        <h2 style="margin-top:0;font-size:1.1rem;">对中记录</h2>
         <table>
           <thead>
             <tr>
               <th>编号</th>
               <th>机组</th>
+              <th>功率档</th>
               <th>误差°</th>
               <th>状态</th>
               <th>结论</th>
+              <th>判定带（认领快照）</th>
               <th>说明</th>
             </tr>
           </thead>
@@ -342,6 +458,7 @@ export class YawAlignApp extends LitElement {
                 <tr>
                   <td>${row.id}</td>
                   <td>${row.turbine_code}</td>
+                  <td>${row.band_name ?? "—"}</td>
                   <td>${row.yaw_err_deg}</td>
                   <td>
                     <span class="tag ${row.status === "pending" ? "pending" : "ok"}">
@@ -353,13 +470,31 @@ export class YawAlignApp extends LitElement {
                       ? html`<span class="tag ${this.verdictClass(row)}">${row.verdict}</span>`
                       : "—"}
                   </td>
+                  <td>${formatBand(row.band_lower_snap, row.band_upper_snap)}</td>
                   <td>${row.reason ?? "—"}</td>
                 </tr>
-              `
+              `,
             )}
           </tbody>
         </table>
       </section>
+    `;
+  }
+
+  render() {
+    if (!this.session) {
+      return this.renderLogin();
+    }
+
+    return html`
+      ${this.renderTopbar()}
+      <main
+        @unauthorized=${() => this.logout()}
+      >
+        ${this.view === "logs"
+          ? this.renderLogsView()
+          : html`<yaw-bands-page .session=${this.session}></yaw-bands-page>`}
+      </main>
     `;
   }
 }
